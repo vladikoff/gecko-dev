@@ -378,11 +378,15 @@ this.FxAccountsClient.prototype = {
    *           type: Type of device (mobile|desktop)
    *         }
    */
-  registerDevice(sessionTokenHex, name, type) {
+  registerDevice(sessionTokenHex, name, type, options = {}) {
     let path = "/account/device";
 
     let creds = deriveHawkCredentials(sessionTokenHex, "sessionToken");
     let body = { name, type };
+
+    if (options.pushCallback) {
+      body.pushCallback = options.pushCallback;
+    }
 
     return this._request(path, "POST", creds, body);
   },
@@ -404,11 +408,15 @@ this.FxAccountsClient.prototype = {
    *           name: Device name
    *         }
    */
-  updateDevice(sessionTokenHex, id, name) {
+  updateDevice(sessionTokenHex, id, name, options = {}) {
     let path = "/account/device";
 
     let creds = deriveHawkCredentials(sessionTokenHex, "sessionToken");
     let body = { id, name };
+
+    if (options.pushCallback) {
+      body.pushCallback = options.pushCallback;
+    }
 
     return this._request(path, "POST", creds, body);
   },

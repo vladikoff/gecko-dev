@@ -33,6 +33,13 @@ XPCOMUtils.defineLazyModuleGetter(this, "FxAccountsProfile",
 XPCOMUtils.defineLazyModuleGetter(this, "Utils",
   "resource://services-sync/util.js");
 
+XPCOMUtils.defineLazyServiceGetter(this, "PushService",
+  "@mozilla.org/push/Service;1", "nsIPushService");
+
+
+const FXA_PUSH_SCOPE_DEVICE = "app://fxa-device-update";
+const FXA_PUSH_TOPIC = "push-notification";
+
 // All properties exposed by the public FxAccounts API.
 var publicProperties = [
   "accountStatus",
@@ -577,7 +584,7 @@ FxAccountsInternal.prototype = {
       // no signed-in user to begin with, this is probably best regarded as an
       // error.
       if (data) {
-        this.pollEmailStatus(currentState, data.sessionToken, "start");
+        this.pollEmailStatus(currentState, data.sessionToken);
         return this.fxAccountsClient.resendVerificationEmail(data.sessionToken);
       }
       throw new Error("Cannot resend verification email; no signed-in user");
@@ -951,7 +958,7 @@ FxAccountsInternal.prototype = {
         if (data) {
           Services.telemetry.getHistogramById("FXA_CONFIGURED").add(1);
           if (!this.isUserEmailVerified(data)) {
-            this.pollEmailStatus(currentState, data.sessionToken, "start");
+            this.pollEmailStatus(currentState, data.sessionToken);
           }
         }
         return data;
@@ -988,7 +995,7 @@ FxAccountsInternal.prototype = {
     }
     if (!currentState.whenVerifiedDeferred) {
       log.debug("whenVerified promise starts polling for verified email");
-      this.pollEmailStatus(currentState, data.sessionToken, "start");
+      this.pollEmailStatus(currentState, data.sessionToken);
     }
     return currentState.whenVerifiedDeferred.promise.then(
       result => currentState.resolve(result)
@@ -1000,88 +1007,56 @@ FxAccountsInternal.prototype = {
     Services.obs.notifyObservers(null, topic, data);
   },
 
-  // XXX - pollEmailStatus should maybe be on the AccountState object?
-  pollEmailStatus: function pollEmailStatus(currentState, sessionToken, why) {
-    log.debug("entering pollEmailStatus: " + why);
-    if (why == "start") {
-      if (this.currentTimer) {
-        log.debug("pollEmailStatus starting while existing timer is running");
-        clearTimeout(this.currentTimer);
-        this.currentTimer = null;
-      }
-
-      // If we were already polling, stop and start again.  This could happen
-      // if the user requested the verification email to be resent while we
-      // were already polling for receipt of an earlier email.
-      this.pollStartDate = Date.now();
-      if (!currentState.whenVerifiedDeferred) {
-        currentState.whenVerifiedDeferred = Promise.defer();
-        // This deferred might not end up with any handlers (eg, if sync
-        // is yet to start up.)  This might cause "A promise chain failed to
-        // handle a rejection" messages, so add an error handler directly
-        // on the promise to log the error.
-        currentState.whenVerifiedDeferred.promise.then(null, err => {
-          log.info("the wait for user verification was stopped: " + err);
-        });
-      }
-    }
-
-    this.checkEmailStatus(sessionToken)
-      .then((response) => {
-        log.debug("checkEmailStatus -> " + JSON.stringify(response));
-        if (response && response.verified) {
-          currentState.updateUserAccountData({ verified: true })
-            .then(() => {
-              return currentState.getUserAccountData();
-            })
-            .then(data => {
-              // Now that the user is verified, we can proceed to fetch keys
-              if (currentState.whenVerifiedDeferred) {
-                currentState.whenVerifiedDeferred.resolve(data);
-                delete currentState.whenVerifiedDeferred;
-              }
-              // Tell FxAccountsManager to clear its cache
-              this.notifyObservers(ON_FXA_UPDATE_NOTIFICATION, ONVERIFIED_NOTIFICATION);
-            });
-        } else {
-          // Poll email status again after a short delay.
-          this.pollEmailStatusAgain(currentState, sessionToken);
+  _waitForPushNotification: function () {
+    return new Promise((resolve) => {
+      // listen for push notifications for account status update
+      Services.obs.addObserver(function observe(subject, topic, data) {
+        if (topic === FXA_PUSH_TOPIC && data === FXA_PUSH_SCOPE_DEVICE) {
+          // got an FxA account status update notification
+          Services.obs.removeObserver(observe, topic, false);
+          resolve();
         }
-      }, error => {
-        let timeoutMs = undefined;
-        if (error && error.retryAfter) {
-          // If the server told us to back off, back off the requested amount.
-          timeoutMs = (error.retryAfter + 3) * 1000;
-        }
-        // The server will return 401 if a request parameter is erroneous or
-        // if the session token expired. Let's continue polling otherwise.
-        if (!error || !error.code || error.code != 401) {
-          this.pollEmailStatusAgain(currentState, sessionToken, timeoutMs);
-        }
-      });
+      }, FXA_PUSH_TOPIC, false);
+    })
   },
 
-  // Poll email status using truncated exponential back-off.
-  pollEmailStatusAgain: function (currentState, sessionToken, timeoutMs) {
-    let ageMs = Date.now() - this.pollStartDate;
-    if (ageMs >= this.POLL_SESSION) {
-      if (currentState.whenVerifiedDeferred) {
-        let error = new Error("User email verification timed out.")
-        currentState.whenVerifiedDeferred.reject(error);
-        delete currentState.whenVerifiedDeferred;
+  // XXX - pollEmailStatus should maybe be on the AccountState object?
+  pollEmailStatus: function pollEmailStatus(currentState, sessionToken) {
+    if (!currentState.whenVerifiedDeferred) {
+      currentState.whenVerifiedDeferred = Promise.defer();
+      // This deferred might not end up with any handlers (eg, if sync
+      // is yet to start up.)  This might cause "A promise chain failed to
+      // handle a rejection" messages, so add an error handler directly
+      // on the promise to log the error.
+      currentState.whenVerifiedDeferred.promise.then(null, err => {
+        log.info("the wait for user verification was stopped: " + err);
+      });
+    }
+
+    log.debug("waiting for push notification");
+    this._waitForPushNotification().then(() => {
+      return this.checkEmailStatus(sessionToken);
+    })
+    .then((response) => {
+      log.debug("checkEmailStatus -> " + JSON.stringify(response));
+      if (response && response.verified) {
+        currentState.updateUserAccountData({verified: true})
+          .then(() => {
+            return currentState.getUserAccountData();
+          })
+          .then(data => {
+            // Now that the user is verified, we can proceed to fetch keys
+            if (currentState.whenVerifiedDeferred) {
+              currentState.whenVerifiedDeferred.resolve(data);
+              delete currentState.whenVerifiedDeferred;
+            }
+            // Tell FxAccountsManager to clear its cache
+            this.notifyObservers(ON_FXA_UPDATE_NOTIFICATION, ONVERIFIED_NOTIFICATION);
+          });
       }
-      log.debug("polling session exceeded, giving up");
-      return;
-    }
-    if (timeoutMs === undefined) {
-      let currentMinute = Math.ceil(ageMs / 60000);
-      timeoutMs = currentMinute <= 2 ? this.VERIFICATION_POLL_TIMEOUT_INITIAL
-                                     : this.VERIFICATION_POLL_TIMEOUT_SUBSEQUENT;
-    }
-    log.debug("polling with timeout = " + timeoutMs);
-    this.currentTimer = setTimeout(() => {
-      this.pollEmailStatus(currentState, sessionToken, "timer");
-    }, timeoutMs);
+    }, error => {
+      // TODO: What do we do here now?
+    });
   },
 
   _requireHttps: function() {
@@ -1389,6 +1364,21 @@ FxAccountsInternal.prototype = {
     }).catch(error => this._logErrorAndSetStaleDeviceFlag(error));
   },
 
+  _registerPushCallback: function () {
+    let pushPrincipal = Services.scriptSecurityManager.getSystemPrincipal();
+
+    return new Promise((resolve, reject) => {
+      PushService.subscribe(FXA_PUSH_SCOPE_DEVICE, pushPrincipal, (result, subscription) => {
+        if (Components.isSuccessCode(result)) {
+          return resolve(subscription);
+        } else {
+          return reject(subscription);
+        }
+      })
+    })
+
+  },
+
   _registerOrUpdateDevice(signedInUser) {
     try {
       // Allow tests to skip device registration because:
@@ -1401,17 +1391,24 @@ FxAccountsInternal.prototype = {
     } catch(ignore) {}
 
     return Promise.resolve().then(() => {
+      return this._registerPushCallback();
+    })
+    .then((subscription) => {
       const deviceName = this._getDeviceName();
+      let deviceOptions = {
+        pushCallback: subscription.endpoint
+      }
 
       if (signedInUser.deviceId) {
         log.debug("updating existing device details");
         return this.fxAccountsClient.updateDevice(
-          signedInUser.sessionToken, signedInUser.deviceId, deviceName);
+          signedInUser.sessionToken, signedInUser.deviceId, deviceName, deviceOptions);
       }
 
       log.debug("registering new device details");
+
       return this.fxAccountsClient.registerDevice(
-        signedInUser.sessionToken, deviceName, this._getDeviceType());
+        signedInUser.sessionToken, deviceName, this._getDeviceType(), deviceOptions);
     }).then(device =>
       this.currentAccountState.updateUserAccountData({
         deviceId: device.id,
